@@ -1,0 +1,56 @@
+@import url('https://fonts.googleapis.com/css2?family=Imbue:opsz,wght@10..100,400;10..100,500;10..100,700;10..100,800&family=Victor+Mono:ital,wght@0,400;0,500;0,600;0,700;1,400;1,600&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --brand-primary: #0B6839;
+  --brand-accent: #FEE101;
+  --brand-pink: #FF0080;
+  --brand-black: #000000;
+  --brand-offwhite: #FFFBE8;
+  --brand-white: #FFFFFF;
+}
+
+body {
+  color: #000000;
+  background-color: #FFFBE8;
+  font-family: var(--font-victor-mono), 'Victor Mono', monospace;
+  -webkit-font-smoothing: antialiased;
+  letter-spacing: -0.01em;
+}
+
+/* Headings in Imbue */
+h1, h2, h3, h4, h5, h6, .font-heading {
+  font-family: var(--font-imbue), 'Imbue', Georgia, serif;
+  letter-spacing: 0.02em;
+}
+
+/* Monospace technical classes */
+.font-mono, body, input, select, textarea, button, table {
+  font-family: var(--font-victor-mono), 'Victor Mono', monospace;
+}
+
+/* Custom developer-led scrollbar */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: #FFFBE8;
+  border-left: 1px solid #000000;
+}
+::-webkit-scrollbar-thumb {
+  background: #0B6839;
+  border: 1px solid #000000;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #000000;
+}
+
+/* Selection style */
+::selection {
+  background-color: #FEE101;
+  color: #000000;
+}
