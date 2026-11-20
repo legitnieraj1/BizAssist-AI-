@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import getDatabase from "@/lib/db";
+import getSupabaseAdmin from "@/lib/supabase";
 import { getCurrentUser } from "@/lib/auth";
 
 export async function POST(
@@ -16,103 +16,115 @@ export async function POST(
     }
 
     const currentUser = await getCurrentUser();
-    const db = getDatabase();
+    const db = getSupabaseAdmin();
 
-    const ticket = db.prepare("SELECT * FROM tickets WHERE id = ?").get(id) as Record<string, unknown> | undefined;
+    const { data: ticket } = await db
+      .from("tickets")
+      .select("*")
+      .eq("id", id)
+      .single();
+
     if (!ticket) {
       return NextResponse.json({ error: "Ticket not found" }, { status: 404 });
     }
 
-    const senderId = currentUser?.id || (body.sender_id || (ticket.customer_id as string));
+    const senderId = currentUser?.id || (body.sender_id || ticket.customer_id);
     const now = new Date().toISOString();
     const msgId = "msg-" + Math.random().toString(36).substring(2, 9);
 
-    db.prepare(`
-      INSERT INTO ticket_messages (id, ticket_id, sender_id, message, attachment_url, is_internal, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
-    `).run(msgId, id, senderId, message.trim(), attachment_url || null, is_internal ? 1 : 0, now);
+    await db.from("ticket_messages").insert({
+      id: msgId,
+      ticket_id: id,
+      sender_id: senderId,
+      message: message.trim(),
+      attachment_url: attachment_url || null,
+      is_internal: is_internal ? true : false,
+      created_at: now
+    });
 
     // Update ticket updated_at
-    db.prepare("UPDATE tickets SET updated_at = ? WHERE id = ?").run(now, id);
+    await db.from("tickets").update({ updated_at: now }).eq("id", id);
 
-    // Auto-update status based on who sent message
-    const sender = db.prepare("SELECT role, full_name FROM users WHERE id = ?").get(senderId) as { role: string; full_name: string } | undefined;
+    // Auto-update status based on sender role
+    const { data: sender } = await db
+      .from("users")
+      .select("role, full_name")
+      .eq("id", senderId)
+      .single();
 
     if (sender?.role === "agent" && !is_internal) {
-      // If agent responds, update status to Waiting for Customer if not resolved
       if (ticket.status !== "Resolved" && ticket.status !== "Closed") {
-        db.prepare("UPDATE tickets SET status = 'Waiting for Customer' WHERE id = ?").run(id);
+        await db.from("tickets").update({ status: "Waiting for Customer" }).eq("id", id);
 
-        db.prepare(`
-          INSERT INTO ticket_history (id, ticket_id, previous_status, new_status, action_type, note, changed_by, created_at)
-          VALUES (?, ?, ?, 'Waiting for Customer', 'status_change', ?, ?, ?)
-        `).run(
-          "hist-" + Math.random().toString(36).substring(2, 9),
-          id,
-          ticket.status,
-          `Agent ${sender.full_name} sent response to customer`,
-          senderId,
-          now
-        );
+        await db.from("ticket_history").insert({
+          id: "hist-" + Math.random().toString(36).substring(2, 9),
+          ticket_id: id,
+          previous_status: ticket.status,
+          new_status: "Waiting for Customer",
+          action_type: "status_change",
+          note: `Agent ${sender.full_name} sent response to customer`,
+          changed_by: senderId,
+          created_at: now
+        });
       }
 
       // Notify customer
-      db.prepare(`
-        INSERT INTO notifications (id, user_id, title, message, type, link, created_at)
-        VALUES (?, ?, ?, ?, 'info', ?, ?)
-      `).run(
-        "notif-" + Math.random().toString(36).substring(2, 9),
-        ticket.customer_id,
-        `New Message on ${ticket.ticket_number}`,
-        `${sender.full_name} replied: "${message.trim().slice(0, 50)}..."`,
-        `/customer/tickets/${id}`,
-        now
-      );
+      await db.from("notifications").insert({
+        id: "notif-" + Math.random().toString(36).substring(2, 9),
+        user_id: ticket.customer_id,
+        title: `New Message on ${ticket.ticket_number}`,
+        message: `${sender.full_name} replied: "${message.trim().slice(0, 50)}..."`,
+        type: "info",
+        link: `/customer/tickets/${id}`,
+        created_at: now
+      });
     } else if (sender?.role === "customer") {
-      // If customer replies and ticket was waiting, change to In Progress
       if (ticket.status === "Waiting for Customer") {
-        db.prepare("UPDATE tickets SET status = 'In Progress' WHERE id = ?").run(id);
+        await db.from("tickets").update({ status: "In Progress" }).eq("id", id);
 
-        db.prepare(`
-          INSERT INTO ticket_history (id, ticket_id, previous_status, new_status, action_type, note, changed_by, created_at)
-          VALUES (?, ?, 'Waiting for Customer', 'In Progress', 'status_change', 'Customer replied with further details', ?, ?)
-        `).run(
-          "hist-" + Math.random().toString(36).substring(2, 9),
-          id,
-          senderId,
-          now
-        );
+        await db.from("ticket_history").insert({
+          id: "hist-" + Math.random().toString(36).substring(2, 9),
+          ticket_id: id,
+          previous_status: "Waiting for Customer",
+          new_status: "In Progress",
+          action_type: "status_change",
+          note: "Customer replied with further details",
+          changed_by: senderId,
+          created_at: now
+        });
       }
 
-      // Notify assigned agent or admin
-      const notifyTarget = ticket.assigned_agent_id as string | null;
-      if (notifyTarget) {
-        db.prepare(`
-          INSERT INTO notifications (id, user_id, title, message, type, link, created_at)
-          VALUES (?, ?, ?, ?, 'info', ?, ?)
-        `).run(
-          "notif-" + Math.random().toString(36).substring(2, 9),
-          notifyTarget,
-          `Customer Replied on ${ticket.ticket_number}`,
-          `${sender.full_name} sent an update.`,
-          `/agent/tickets/${id}`,
-          now
-        );
+      if (ticket.assigned_agent_id) {
+        await db.from("notifications").insert({
+          id: "notif-" + Math.random().toString(36).substring(2, 9),
+          user_id: ticket.assigned_agent_id,
+          title: `Customer Replied on ${ticket.ticket_number}`,
+          message: `${sender.full_name} sent an update.`,
+          type: "info",
+          link: `/agent/tickets/${id}`,
+          created_at: now
+        });
       }
     }
 
-    const insertedMsg = db.prepare(`
-      SELECT 
-        m.*,
-        u.full_name as sender_name,
-        u.role as sender_role,
-        u.avatar_url as sender_avatar
-      FROM ticket_messages m
-      LEFT JOIN users u ON m.sender_id = u.id
-      WHERE m.id = ?
-    `).get(msgId);
+    // Return the inserted message with sender info
+    const { data: insertedMsg } = await db
+      .from("ticket_messages")
+      .select(`*, sender:users!ticket_messages_sender_id_fkey(full_name, role, avatar_url)`)
+      .eq("id", msgId)
+      .single();
 
-    return NextResponse.json({ success: true, message: insertedMsg });
+    const flatMsg = insertedMsg
+      ? {
+          ...insertedMsg,
+          sender_name: insertedMsg.sender?.full_name,
+          sender_role: insertedMsg.sender?.role,
+          sender_avatar: insertedMsg.sender?.avatar_url,
+          sender: undefined
+        }
+      : null;
+
+    return NextResponse.json({ success: true, message: flatMsg });
   } catch (err: unknown) {
     return NextResponse.json({ error: (err as Error).message }, { status: 500 });
   }

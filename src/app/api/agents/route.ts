@@ -1,28 +1,41 @@
 import { NextResponse } from "next/server";
-import getDatabase from "@/lib/db";
+import getSupabaseAdmin from "@/lib/supabase";
 
 export async function GET() {
   try {
-    const db = getDatabase();
+    const db = getSupabaseAdmin();
 
-    const agents = db.prepare(`
-      SELECT 
-        u.id,
-        u.full_name,
-        u.email,
-        u.phone,
-        u.role,
-        u.avatar_url,
-        COUNT(t.id) as total_assigned,
-        SUM(CASE WHEN t.status IN ('Open', 'Assigned', 'In Progress') THEN 1 ELSE 0 END) as active_tickets,
-        SUM(CASE WHEN t.status IN ('Resolved', 'Closed') THEN 1 ELSE 0 END) as resolved_tickets,
-        SUM(CASE WHEN t.priority = 'Critical' AND t.status NOT IN ('Resolved', 'Closed') THEN 1 ELSE 0 END) as critical_tickets
-      FROM users u
-      LEFT JOIN tickets t ON u.id = t.assigned_agent_id
-      WHERE u.role = 'agent'
-      GROUP BY u.id
-      ORDER BY u.full_name ASC
-    `).all();
+    const { data: agentUsers } = await db
+      .from("users")
+      .select("id, full_name, email, phone, role, avatar_url")
+      .eq("role", "agent")
+      .order("full_name");
+
+    type AgentUser = {
+      id: string;
+      full_name: string;
+      email: string;
+      phone: string;
+      role: string;
+      avatar_url: string;
+    };
+
+    const agents = await Promise.all(
+      ((agentUsers || []) as AgentUser[]).map(async (agent) => {
+        const { data: agentTickets } = await db
+          .from("tickets")
+          .select("status, priority")
+          .eq("assigned_agent_id", agent.id);
+
+        const tList = (agentTickets || []) as { status: string; priority: string }[];
+        const total_assigned = tList.length;
+        const active_tickets = tList.filter(t => ["Open", "Assigned", "In Progress"].includes(t.status)).length;
+        const resolved_tickets = tList.filter(t => ["Resolved", "Closed"].includes(t.status)).length;
+        const critical_tickets = tList.filter(t => t.priority === "Critical" && !["Resolved", "Closed"].includes(t.status)).length;
+
+        return { ...agent, total_assigned, active_tickets, resolved_tickets, critical_tickets };
+      })
+    );
 
     return NextResponse.json({ agents });
   } catch (err: unknown) {

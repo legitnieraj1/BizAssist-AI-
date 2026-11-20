@@ -1,5 +1,5 @@
 import { cookies } from "next/headers";
-import getDatabase from "./db";
+import getSupabaseAdmin from "./supabase";
 
 export interface UserSession {
   id: string;
@@ -16,17 +16,18 @@ const COOKIE_NAME = "bizassist_session";
 export async function getCurrentUser(): Promise<UserSession | null> {
   const cookieStore = await cookies();
   const sessionVal = cookieStore.get(COOKIE_NAME)?.value;
-
-  if (!sessionVal) {
-    // Default to admin for seamless evaluation if no cookie set, or return null
-    return null;
-  }
+  if (!sessionVal) return null;
 
   try {
     const parsed = JSON.parse(decodeURIComponent(sessionVal));
-    const db = getDatabase();
-    const user = db.prepare("SELECT id, full_name, email, phone, role, avatar_url, created_at FROM users WHERE id = ?").get(parsed.id) as UserSession | undefined;
-    return user || null;
+    const db = getSupabaseAdmin();
+    const { data, error } = await db
+      .from("users")
+      .select("id, full_name, email, phone, role, avatar_url, created_at")
+      .eq("id", parsed.id)
+      .single();
+    if (error || !data) return null;
+    return data as UserSession;
   } catch {
     return null;
   }
@@ -37,9 +38,9 @@ export async function setSessionCookie(user: UserSession) {
   const val = encodeURIComponent(JSON.stringify({ id: user.id, role: user.role }));
   cookieStore.set(COOKIE_NAME, val, {
     path: "/",
-    httpOnly: false, // accessible for client navbar quick-switch
+    httpOnly: false,
     sameSite: "lax",
-    maxAge: 60 * 60 * 24 * 7 // 7 days
+    maxAge: 60 * 60 * 24 * 7
   });
 }
 
@@ -48,24 +49,44 @@ export async function clearSessionCookie() {
   cookieStore.delete(COOKIE_NAME);
 }
 
-export function findUserByEmail(email: string): UserSession | null {
-  const db = getDatabase();
-  const user = db.prepare("SELECT id, full_name, email, phone, role, avatar_url, created_at FROM users WHERE email = ?").get(email) as UserSession | undefined;
-  return user || null;
+export async function findUserByEmail(email: string): Promise<(UserSession & { password_hash: string }) | null> {
+  const db = getSupabaseAdmin();
+  const { data, error } = await db
+    .from("users")
+    .select("id, full_name, email, password_hash, phone, role, avatar_url, created_at")
+    .eq("email", email.trim().toLowerCase())
+    .single();
+  if (error || !data) return null;
+  return data as UserSession & { password_hash: string };
 }
 
-export function findUserById(id: string): UserSession | null {
-  const db = getDatabase();
-  const user = db.prepare("SELECT id, full_name, email, phone, role, avatar_url, created_at FROM users WHERE id = ?").get(id) as UserSession | undefined;
-  return user || null;
+export async function findUserById(id: string): Promise<UserSession | null> {
+  const db = getSupabaseAdmin();
+  const { data, error } = await db
+    .from("users")
+    .select("id, full_name, email, phone, role, avatar_url, created_at")
+    .eq("id", id)
+    .single();
+  if (error || !data) return null;
+  return data as UserSession;
 }
 
-export function getAllAgents(): UserSession[] {
-  const db = getDatabase();
-  return db.prepare("SELECT id, full_name, email, phone, role, avatar_url, created_at FROM users WHERE role = 'agent' ORDER BY full_name ASC").all() as UserSession[];
+export async function getAllAgents(): Promise<UserSession[]> {
+  const db = getSupabaseAdmin();
+  const { data } = await db
+    .from("users")
+    .select("id, full_name, email, phone, role, avatar_url, created_at")
+    .eq("role", "agent")
+    .order("full_name");
+  return (data as UserSession[]) || [];
 }
 
-export function getAllCustomers(): UserSession[] {
-  const db = getDatabase();
-  return db.prepare("SELECT id, full_name, email, phone, role, avatar_url, created_at FROM users WHERE role = 'customer' ORDER BY created_at DESC").all() as UserSession[];
+export async function getAllCustomers(): Promise<UserSession[]> {
+  const db = getSupabaseAdmin();
+  const { data } = await db
+    .from("users")
+    .select("id, full_name, email, phone, role, avatar_url, created_at")
+    .eq("role", "customer")
+    .order("created_at", { ascending: false });
+  return (data as UserSession[]) || [];
 }

@@ -5,6 +5,8 @@
 @tailwind utilities;
 
 :root {
+  --font-imbue: 'Imbue', Georgia, serif;
+  --font-victor-mono: 'Victor Mono', monospace;
   --brand-primary: #0B6839;
   --brand-accent: #FEE101;
   --brand-pink: #FF0080;

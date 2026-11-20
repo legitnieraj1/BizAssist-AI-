@@ -1,17 +1,23 @@
 import { NextResponse } from "next/server";
-import getDatabase from "@/lib/db";
+import getSupabaseAdmin from "@/lib/supabase";
 import { setSessionCookie, UserSession } from "@/lib/auth";
 
 export async function POST(request: Request) {
   try {
     const { email, password, demoRole } = await request.json();
-    const db = getDatabase();
+    const db = getSupabaseAdmin();
 
     // Fast demo login support
     if (demoRole) {
-      const demoUser = db.prepare("SELECT id, full_name, email, phone, role, avatar_url, created_at FROM users WHERE role = ? LIMIT 1").get(demoRole) as UserSession | undefined;
+      const { data: demoUser } = await db
+        .from("users")
+        .select("id, full_name, email, phone, role, avatar_url, created_at")
+        .eq("role", demoRole)
+        .limit(1)
+        .single();
+
       if (demoUser) {
-        await setSessionCookie(demoUser);
+        await setSessionCookie(demoUser as UserSession);
         return NextResponse.json({ success: true, user: demoUser });
       }
     }
@@ -20,14 +26,18 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: "Email and password are required" }, { status: 400 });
     }
 
-    const user = db.prepare("SELECT id, full_name, email, password_hash, phone, role, avatar_url, created_at FROM users WHERE email = ?").get(email.trim().toLowerCase()) as (UserSession & { password_hash: string }) | undefined;
+    const { data: user } = await db
+      .from("users")
+      .select("*")
+      .eq("email", email.trim().toLowerCase())
+      .single();
 
     if (!user || user.password_hash !== password) {
       return NextResponse.json({ error: "Invalid email or password" }, { status: 401 });
     }
 
     const { password_hash, ...safeUser } = user;
-    await setSessionCookie(safeUser);
+    await setSessionCookie(safeUser as UserSession);
 
     return NextResponse.json({ success: true, user: safeUser });
   } catch (err: unknown) {

@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import getDatabase from "@/lib/db";
+import getSupabaseAdmin from "@/lib/supabase";
 import { regenerateAIResponse } from "@/lib/ai-service";
 
 export async function POST(
@@ -9,23 +9,26 @@ export async function POST(
   try {
     const { id } = await params;
     const { tone } = await request.json();
+    const db = getSupabaseAdmin();
 
-    const db = getDatabase();
-    const ticket = db.prepare("SELECT * FROM tickets WHERE id = ?").get(id) as Record<string, unknown> | undefined;
+    const { data: ticket } = await db
+      .from("tickets")
+      .select("*")
+      .eq("id", id)
+      .single();
 
     if (!ticket) {
       return NextResponse.json({ error: "Ticket not found" }, { status: 404 });
     }
 
     const newResponse = await regenerateAIResponse(
-      ticket.subject as string,
-      ticket.description as string,
+      ticket.subject,
+      ticket.description,
       tone || "Empathetic",
-      ticket.ai_summary as string
+      ticket.ai_summary
     );
 
-    // Update in database so it persists
-    db.prepare("UPDATE tickets SET ai_suggested_response = ? WHERE id = ?").run(newResponse, id);
+    await db.from("tickets").update({ ai_suggested_response: newResponse }).eq("id", id);
 
     return NextResponse.json({ success: true, suggested_response: newResponse });
   } catch (err: unknown) {

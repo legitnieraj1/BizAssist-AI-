@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import getDatabase from "@/lib/db";
+import getSupabaseAdmin from "@/lib/supabase";
 import { getCurrentUser } from "@/lib/auth";
 import { analyzeTicketWithAI } from "@/lib/ai-service";
 
@@ -7,6 +7,7 @@ export async function GET(request: Request) {
   try {
     const { searchParams } = new URL(request.url);
     const currentUser = await getCurrentUser();
+    const db = getSupabaseAdmin();
 
     const status = searchParams.get("status");
     const priority = searchParams.get("priority");
@@ -15,70 +16,61 @@ export async function GET(request: Request) {
     const assignedAgentId = searchParams.get("assigned_agent_id");
     const customerId = searchParams.get("customer_id");
 
-    const db = getDatabase();
+    // Build a Postgres query via RPC or use the Supabase query builder with joins
+    // We use a raw SQL approach via rpc for the complex join + ordering
+    let query = db
+      .from("tickets")
+      .select(`
+        *,
+        customer:users!tickets_customer_id_fkey(full_name, email, avatar_url),
+        agent:users!tickets_assigned_agent_id_fkey(full_name, avatar_url)
+      `);
 
-    let query = `
-      SELECT 
-        t.*,
-        c.full_name as customer_name,
-        c.email as customer_email,
-        c.avatar_url as customer_avatar,
-        a.full_name as agent_name,
-        a.avatar_url as agent_avatar
-      FROM tickets t
-      LEFT JOIN users c ON t.customer_id = c.id
-      LEFT JOIN users a ON t.assigned_agent_id = a.id
-      WHERE 1=1
-    `;
-    const params: (string | number)[] = [];
-
-    // Role-based visibility isolation (PRD Section 9)
+    // Role-based isolation
     if (currentUser?.role === "customer") {
-      query += ` AND t.customer_id = ?`;
-      params.push(currentUser.id);
+      query = query.eq("customer_id", currentUser.id);
     } else if (currentUser?.role === "agent" && searchParams.get("my_assigned") === "true") {
-      query += ` AND t.assigned_agent_id = ?`;
-      params.push(currentUser.id);
+      query = query.eq("assigned_agent_id", currentUser.id);
     }
 
-    if (customerId) {
-      query += ` AND t.customer_id = ?`;
-      params.push(customerId);
-    }
+    if (customerId) query = query.eq("customer_id", customerId);
 
     if (assignedAgentId) {
       if (assignedAgentId === "unassigned") {
-        query += ` AND t.assigned_agent_id IS NULL`;
+        query = query.is("assigned_agent_id", null);
       } else {
-        query += ` AND t.assigned_agent_id = ?`;
-        params.push(assignedAgentId);
+        query = query.eq("assigned_agent_id", assignedAgentId);
       }
     }
 
-    if (status && status !== "All") {
-      query += ` AND t.status = ?`;
-      params.push(status);
-    }
-
-    if (priority && priority !== "All") {
-      query += ` AND t.priority = ?`;
-      params.push(priority);
-    }
-
-    if (category && category !== "All") {
-      query += ` AND t.category = ?`;
-      params.push(category);
-    }
+    if (status && status !== "All") query = query.eq("status", status);
+    if (priority && priority !== "All") query = query.eq("priority", priority);
+    if (category && category !== "All") query = query.eq("category", category);
 
     if (search && search.trim().length > 0) {
-      query += ` AND (t.ticket_number LIKE ? OR t.subject LIKE ? OR t.description LIKE ? OR c.full_name LIKE ?)`;
-      const term = `%${search.trim()}%`;
-      params.push(term, term, term, term);
+      const term = search.trim();
+      query = query.or(`ticket_number.ilike.%${term}%,subject.ilike.%${term}%,description.ilike.%${term}%`);
     }
 
-    query += ` ORDER BY CASE WHEN t.priority = 'Critical' THEN 1 WHEN t.priority = 'High' THEN 2 WHEN t.priority = 'Medium' THEN 3 ELSE 4 END, t.created_at DESC`;
+    // Priority ordering: Critical=1, High=2, Medium=3, Low=4
+    const { data, error } = await query.order("created_at", { ascending: false });
 
-    const tickets = db.prepare(query).all(...params);
+    if (error) return NextResponse.json({ error: error.message }, { status: 500 });
+
+    // Flatten nested join data and sort by priority
+    const priorityOrder: Record<string, number> = { Critical: 1, High: 2, Medium: 3, Low: 4 };
+    const tickets = ((data || []) as any[])
+      .map((t) => ({
+        ...t,
+        customer_name: t.customer?.full_name,
+        customer_email: t.customer?.email,
+        customer_avatar: t.customer?.avatar_url,
+        agent_name: t.agent?.full_name,
+        agent_avatar: t.agent?.avatar_url,
+        customer: undefined,
+        agent: undefined
+      }))
+      .sort((a, b) => (priorityOrder[a.priority] ?? 5) - (priorityOrder[b.priority] ?? 5));
 
     return NextResponse.json({ tickets });
   } catch (err: unknown) {
@@ -96,154 +88,161 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: "Subject and description are required" }, { status: 400 });
     }
 
-    const db = getDatabase();
+    const db = getSupabaseAdmin();
 
     // Determine customer ID
-    let customerId = currentUser?.id;
-    if (!customerId || currentUser?.role !== "customer") {
-      // Find or fallback to Sarah Jenkins or first customer
-      const defaultCustomer = db.prepare("SELECT id, email, phone FROM users WHERE role = 'customer' LIMIT 1").get() as { id: string; email: string; phone: string };
-      customerId = defaultCustomer.id;
+    let customerId = currentUser?.role === "customer" ? currentUser.id : null;
+    if (!customerId) {
+      const { data: defaultCustomer } = await db
+        .from("users")
+        .select("id, email, phone")
+        .eq("role", "customer")
+        .limit(1)
+        .single();
+      customerId = defaultCustomer?.id || "usr-cust-1";
     }
 
-    // 1. Run AI Ticket Classification (Module 3 & 5 & 4)
+    // 1. Run AI Classification
     const aiAnalysis = await analyzeTicketWithAI(subject, description, userCategory);
 
-    // 2. Generate unique Ticket Number (e.g. BIZ-1006)
-    const countRow = db.prepare("SELECT COUNT(*) as count FROM tickets").get() as { count: number };
-    const ticketNumber = `BIZ-${1000 + countRow.count + 1}`;
+    // 2. Generate unique Ticket Number
+    const { count } = await db.from("tickets").select("*", { count: "exact", head: true });
+    const ticketNumber = `BIZ-${1000 + (count || 0) + 1}`;
     const ticketId = "tkt-" + Math.random().toString(36).substring(2, 9);
     const now = new Date().toISOString();
 
-    // 3. Optional Smart Auto-Assignment (find agent with fewest open tickets)
+    // 3. Smart Auto-Assignment for Critical/High tickets
     let assignedAgentId: string | null = null;
     let agentName: string | null = null;
 
     if (aiAnalysis.priority === "Critical" || aiAnalysis.priority === "High") {
-      const agentWithLeastLoad = db.prepare(`
-        SELECT u.id, u.full_name, COUNT(t.id) as open_tickets
-        FROM users u
-        LEFT JOIN tickets t ON u.id = t.assigned_agent_id AND t.status IN ('Open', 'Assigned', 'In Progress')
-        WHERE u.role = 'agent'
-        GROUP BY u.id
-        ORDER BY open_tickets ASC, u.id ASC
-        LIMIT 1
-      `).get() as { id: string; full_name: string } | undefined;
+      // Get agent with fewest active tickets
+      const { data: agents } = await db
+        .from("users")
+        .select("id, full_name")
+        .eq("role", "agent");
 
-      if (agentWithLeastLoad) {
-        assignedAgentId = agentWithLeastLoad.id;
-        agentName = agentWithLeastLoad.full_name;
+      if (agents && agents.length > 0) {
+        // Count active tickets per agent
+        const agentLoads = await Promise.all(
+          ((agents || []) as any[]).map(async (agent: any) => {
+            const { count: activeCount } = await db
+              .from("tickets")
+              .select("*", { count: "exact", head: true })
+              .eq("assigned_agent_id", agent.id)
+              .in("status", ["Open", "Assigned", "In Progress"]);
+            return { ...agent, activeCount: activeCount || 0 };
+          })
+        );
+        agentLoads.sort((a, b) => a.activeCount - b.activeCount);
+        assignedAgentId = agentLoads[0].id;
+        agentName = agentLoads[0].full_name;
       }
     }
 
     const initialStatus = assignedAgentId ? "Assigned" : "Open";
 
     // 4. Insert Ticket
-    db.prepare(`
-      INSERT INTO tickets (
-        id, ticket_number, customer_id, assigned_agent_id, subject, description,
-        category, priority, sentiment, ai_summary, ai_suggested_response, status,
-        contact_email, contact_phone, attachment_name, attachment_url, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(
-      ticketId,
-      ticketNumber,
-      customerId,
-      assignedAgentId,
-      subject.trim(),
-      description.trim(),
-      aiAnalysis.category,
-      aiAnalysis.priority,
-      aiAnalysis.sentiment,
-      aiAnalysis.summary,
-      aiAnalysis.suggested_response,
-      initialStatus,
-      contact_email || currentUser?.email || "customer@example.com",
-      contact_phone || currentUser?.phone || null,
-      attachment_name || null,
-      attachment_url || null,
-      now,
-      now
-    );
+    const { error: ticketError } = await db.from("tickets").insert({
+      id: ticketId,
+      ticket_number: ticketNumber,
+      customer_id: customerId,
+      assigned_agent_id: assignedAgentId,
+      subject: subject.trim(),
+      description: description.trim(),
+      category: aiAnalysis.category,
+      priority: aiAnalysis.priority,
+      sentiment: aiAnalysis.sentiment,
+      ai_summary: aiAnalysis.summary,
+      ai_suggested_response: aiAnalysis.suggested_response,
+      status: initialStatus,
+      contact_email: contact_email || currentUser?.email || "customer@example.com",
+      contact_phone: contact_phone || currentUser?.phone || null,
+      attachment_name: attachment_name || null,
+      attachment_url: attachment_url || null,
+      created_at: now,
+      updated_at: now
+    });
 
-    // 5. Insert initial complaint message
-    const msgId = "msg-" + Math.random().toString(36).substring(2, 9);
-    db.prepare(`
-      INSERT INTO ticket_messages (id, ticket_id, sender_id, message, attachment_url, is_internal, created_at)
-      VALUES (?, ?, ?, ?, ?, 0, ?)
-    `).run(msgId, ticketId, customerId, description.trim(), attachment_url || null, now);
+    if (ticketError) return NextResponse.json({ error: ticketError.message }, { status: 500 });
 
-    // 6. Record Ticket History
-    const histId1 = "hist-" + Math.random().toString(36).substring(2, 9);
-    db.prepare(`
-      INSERT INTO ticket_history (id, ticket_id, previous_status, new_status, action_type, note, changed_by, created_at)
-      VALUES (?, ?, NULL, ?, 'ai_classified', ?, ?, ?)
-    `).run(
-      histId1,
-      ticketId,
-      initialStatus,
-      `AI Auto-Classified: [Category: ${aiAnalysis.category}, Priority: ${aiAnalysis.priority}, Sentiment: ${aiAnalysis.sentiment}]`,
-      customerId,
-      now
-    );
+    // 5. Insert initial message
+    await db.from("ticket_messages").insert({
+      id: "msg-" + Math.random().toString(36).substring(2, 9),
+      ticket_id: ticketId,
+      sender_id: customerId,
+      message: description.trim(),
+      attachment_url: attachment_url || null,
+      is_internal: false,
+      created_at: now
+    });
+
+    // 6. Record AI Classification history
+    await db.from("ticket_history").insert({
+      id: "hist-" + Math.random().toString(36).substring(2, 9),
+      ticket_id: ticketId,
+      previous_status: null,
+      new_status: initialStatus,
+      action_type: "ai_classified",
+      note: `AI Auto-Classified: [Category: ${aiAnalysis.category}, Priority: ${aiAnalysis.priority}, Sentiment: ${aiAnalysis.sentiment}]`,
+      changed_by: customerId,
+      created_at: now
+    });
 
     if (assignedAgentId) {
-      const histId2 = "hist-" + Math.random().toString(36).substring(2, 9);
-      db.prepare(`
-        INSERT INTO ticket_history (id, ticket_id, previous_status, new_status, action_type, note, changed_by, created_at)
-        VALUES (?, ?, 'Open', 'Assigned', 'agent_assigned', ?, ?, ?)
-      `).run(
-        histId2,
-        ticketId,
-        `Auto-assigned to agent ${agentName} based on workload & ${aiAnalysis.priority} priority`,
-        customerId,
-        now
-      );
+      await db.from("ticket_history").insert({
+        id: "hist-" + Math.random().toString(36).substring(2, 9),
+        ticket_id: ticketId,
+        previous_status: "Open",
+        new_status: "Assigned",
+        action_type: "agent_assigned",
+        note: `Auto-assigned to agent ${agentName} based on workload & ${aiAnalysis.priority} priority`,
+        changed_by: customerId,
+        created_at: now
+      });
 
       // Notify agent
-      db.prepare(`
-        INSERT INTO notifications (id, user_id, title, message, type, link, created_at)
-        VALUES (?, ?, ?, ?, 'info', ?, ?)
-      `).run(
-        "notif-" + Math.random().toString(36).substring(2, 9),
-        assignedAgentId,
-        `New Ticket Assigned: ${ticketNumber}`,
-        `Ticket "${subject.slice(0, 40)}" (${aiAnalysis.priority} Priority) was assigned to you.`,
-        `/agent/tickets/${ticketId}`,
-        now
-      );
+      await db.from("notifications").insert({
+        id: "notif-" + Math.random().toString(36).substring(2, 9),
+        user_id: assignedAgentId,
+        title: `New Ticket Assigned: ${ticketNumber}`,
+        message: `Ticket "${subject.slice(0, 40)}" (${aiAnalysis.priority} Priority) was assigned to you.`,
+        type: "info",
+        link: `/agent/tickets/${ticketId}`,
+        created_at: now
+      });
     }
 
     // 7. Notify Admins if Critical
     if (aiAnalysis.priority === "Critical") {
-      const admins = db.prepare("SELECT id FROM users WHERE role = 'admin'").all() as { id: string }[];
-      for (const admin of admins) {
-        db.prepare(`
-          INSERT INTO notifications (id, user_id, title, message, type, link, created_at)
-          VALUES (?, ?, ?, ?, 'alert', ?, ?)
-        `).run(
-          "notif-" + Math.random().toString(36).substring(2, 9),
-          admin.id,
-          `Critical Ticket Alert: ${ticketNumber}`,
-          `Critical issue reported: "${subject.slice(0, 45)}" with sentiment "${aiAnalysis.sentiment}".`,
-          `/admin/tickets/${ticketId}`,
-          now
+      const { data: admins } = await db.from("users").select("id").eq("role", "admin");
+      if (admins) {
+        await Promise.all(
+          ((admins || []) as any[]).map((admin: any) =>
+            db.from("notifications").insert({
+              id: "notif-" + Math.random().toString(36).substring(2, 9),
+              user_id: admin.id,
+              title: `Critical Ticket Alert: ${ticketNumber}`,
+              message: `Critical issue reported: "${subject.slice(0, 45)}" with sentiment "${aiAnalysis.sentiment}".`,
+              type: "alert",
+              link: `/admin/tickets/${ticketId}`,
+              created_at: now
+            })
+          )
         );
       }
     }
 
-    // 8. Notify Customer of Ticket Creation
-    db.prepare(`
-      INSERT INTO notifications (id, user_id, title, message, type, link, created_at)
-      VALUES (?, ?, ?, ?, 'success', ?, ?)
-    `).run(
-      "notif-" + Math.random().toString(36).substring(2, 9),
-      customerId,
-      `Ticket Created: ${ticketNumber}`,
-      `Your support ticket has been received and prioritized as ${aiAnalysis.priority}.`,
-      `/customer/tickets/${ticketId}`,
-      now
-    );
+    // 8. Notify Customer
+    await db.from("notifications").insert({
+      id: "notif-" + Math.random().toString(36).substring(2, 9),
+      user_id: customerId,
+      title: `Ticket Created: ${ticketNumber}`,
+      message: `Your support ticket has been received and prioritized as ${aiAnalysis.priority}.`,
+      type: "success",
+      link: `/customer/tickets/${ticketId}`,
+      created_at: now
+    });
 
     return NextResponse.json({
       success: true,

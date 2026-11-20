@@ -1,30 +1,27 @@
 import { NextResponse } from "next/server";
-import getDatabase from "@/lib/db";
+import getSupabaseAdmin from "@/lib/supabase";
 
 export async function GET(request: Request) {
   try {
     const { searchParams } = new URL(request.url);
     const category = searchParams.get("category");
     const search = searchParams.get("search");
+    const db = getSupabaseAdmin();
 
-    const db = getDatabase();
-    let query = "SELECT * FROM knowledge_base WHERE 1=1";
-    const params: string[] = [];
+    let query = db.from("knowledge_base").select("*").order("view_count", { ascending: false }).order("created_at", { ascending: false });
 
     if (category && category !== "All") {
-      query += " AND category = ?";
-      params.push(category);
+      query = query.eq("category", category);
     }
 
     if (search && search.trim().length > 0) {
-      query += " AND (title LIKE ? OR content LIKE ? OR tags LIKE ?)";
-      const term = `%${search.trim()}%`;
-      params.push(term, term, term);
+      const term = search.trim();
+      query = query.or(`title.ilike.%${term}%,content.ilike.%${term}%,tags.ilike.%${term}%`);
     }
 
-    query += " ORDER BY view_count DESC, created_at DESC";
+    const { data: articles, error } = await query;
+    if (error) return NextResponse.json({ error: error.message }, { status: 500 });
 
-    const articles = db.prepare(query).all(...params);
     return NextResponse.json({ articles });
   } catch (err: unknown) {
     return NextResponse.json({ error: (err as Error).message }, { status: 500 });
@@ -39,16 +36,28 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: "Title, content, and category are required" }, { status: 400 });
     }
 
-    const db = getDatabase();
+    const db = getSupabaseAdmin();
     const id = "kb-" + Math.random().toString(36).substring(2, 9);
     const now = new Date().toISOString();
 
-    db.prepare(`
-      INSERT INTO knowledge_base (id, title, content, category, tags, view_count, is_published, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, 0, 1, ?, ?)
-    `).run(id, title.trim(), content.trim(), category, tags || "", now, now);
+    const { data: article, error } = await db
+      .from("knowledge_base")
+      .insert({
+        id,
+        title: title.trim(),
+        content: content.trim(),
+        category,
+        tags: tags || "",
+        view_count: 0,
+        is_published: true,
+        created_at: now,
+        updated_at: now
+      })
+      .select()
+      .single();
 
-    const article = db.prepare("SELECT * FROM knowledge_base WHERE id = ?").get(id);
+    if (error) return NextResponse.json({ error: error.message }, { status: 500 });
+
     return NextResponse.json({ success: true, article });
   } catch (err: unknown) {
     return NextResponse.json({ error: (err as Error).message }, { status: 500 });
